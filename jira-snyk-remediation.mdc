@@ -1,0 +1,319 @@
+---
+description: resolve Jira Snyk tickets locally by reading the Jira issue, opening the advisory link, finding the minimum safe version, applying the smallest safe dependency fix, updating yarn.lock, creating a new protected branch from main, opening a PR, and reading CI results. fail fast on missing MCP access, missing advisory details, or blocked GitHub visibility.
+globs:
+  - "package.json"
+  - "yarn.lock"
+  - "**/package.json"
+  - "**/yarn.lock"
+  - ".github/workflows/**/*.yml"
+  - ".github/workflows/**/*.yaml"
+alwaysApply: false
+---
+
+# Jira Snyk remediation rule
+
+Use this rule when the user asks to resolve a Jira Snyk or dependency vulnerability ticket and provides a Jira key such as `CP-54783`.
+
+## Core behavior
+
+- Make the smallest safe fix.
+- **Match scope to the Jira/Snyk issue** (usually one cited `package.json` path); expand to other manifests only when the ticket or user explicitly includes them.
+- Prefer existing repo patterns.
+- Keep the diff small.
+- Do not improvise around broken access or missing data.
+- If a required capability fails, stop immediately and report the failure summary table.
+
+## Fail-fast policy
+
+Required capabilities for this workflow:
+
+1. Jira MCP can read the ticket
+2. the advisory link can be found
+3. the advisory link can be opened
+4. the minimum safe version can be identified
+5. the affected package or dependency path can be identified
+6. GitHub access is available for PR creation and PR/check reading
+7. local git access is available for branch creation and commits
+8. Node.js satisfies the repo’s `engines.node` (or is switched via nvm before `yarn install`)
+
+If any required capability is unavailable:
+
+- stop immediately
+- do not keep searching for alternate paths
+- do not switch to different tools or integrations unless the user explicitly asks
+- do not modify files after a failed required checkpoint
+- output the checkpoint summary table
+
+## Checkpoint tracking
+
+Track these checkpoints during execution:
+
+| ID | Checkpoint | Pass condition |
+|---|---|---|
+| C0 | Node / engines | `node -v` meets root `package.json` `engines.node` (e.g. `>=20.9.0`), or nvm switched to a supported version before install |
+| C1 | Jira access | Jira MCP opened the ticket |
+| C2 | Advisory link found | advisory link found in ticket |
+| C3 | Advisory opened | advisory page content is readable |
+| C4 | Fix version found | minimum safe version identified |
+| C5 | Target identified | vulnerable npm package **and** the **manifest path** named in Jira/Snyk (e.g. root `package.json` vs a nested path); if unclear, ask before editing |
+| C6 | Main updated | checked out `main` and pulled latest |
+| C7 | Branch created | new task branch created from `main` |
+| C8 | Fix applied | dependency change made |
+| C9 | Lockfile updated | `yarn.lock` updated when expected |
+| C10 | Local validation | required local checks completed |
+| C11 | PR created | A **GitHub pull request exists** from `CREATED_BRANCH` into `main` (push alone is **not** enough); PR URL is known |
+| C12 | CI read | PR checks read at **~5 minutes** after **PR creation** (T0), then **investigate failures immediately** (see **CI loop**). A **final** read around **~30 minutes** after T0 is optional to confirm long jobs; do **not** block investigation until the 30-minute mark. |
+| C13 | CI follow-up | optional CI fix or **re-run** applied on same branch (see **CI loop**) |
+
+Status values:
+- PASS
+- FAIL
+- SKIPPED
+
+On any required failure, stop and output:
+
+| Checkpoint | Status | Reason |
+|---|---|---|
+| C1 | PASS/FAIL/SKIPPED | short reason |
+| C2 | PASS/FAIL/SKIPPED | short reason |
+
+Keep reasons brief and concrete.
+
+## Questions and recommendations
+
+Ask a question only when the answer materially changes the fix.
+
+Rules:
+- ask one question at a time
+- max 3 questions
+- use lettered options when useful
+- mark the recommended option with `✓ [Recommended]`
+- explain the recommendation in one line
+- if the user says proceed, use the recommended option
+
+Good cases for a question:
+- **which `package.json` / workspace the Jira issue targets** (e.g. Snyk often names `Org/repo:package.json` at repo root—do not assume every nested `apps/*` manifest must change unless the ticket or user says so)
+- which workspace/package is affected when the ticket is ambiguous
+- whether a major-version bump is acceptable
+- whether to prefer direct-parent upgrade vs override/resolution
+
+## Node.js before `yarn install`
+
+Yarn and dependencies often declare a minimum Node version. If `yarn install` fails with an engine-unsupported error, or Node is older than `engines.node`, fix the shell first—do not treat it as a dependency-resolution failure.
+
+1. Read root `package.json` `engines.node` (if present).
+2. Run `node -v` and confirm it satisfies the range.
+3. If not, and **nvm** is available, select a version that satisfies engines (for `>=20.9.0`, a current Node 20 LTS such as `20.19.0` is appropriate):
+
+```bash
+command -v nvm >/dev/null 2>&1 || { [ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh"; }
+nvm use 20.19.0   # or: nvm install 20 && nvm use 20
+```
+
+4. If the repo adds a `.nvmrc`, prefer `nvm use` with that file.
+5. Re-run `yarn install` after Node is aligned.
+
+## Scope: which `package.json` to change
+
+- **Default to the path the ticket calls out.** Jira/Snyk issues often cite a single failure, e.g. `CertifyOS/certifyos:package.json` → remediate **root** `package.json` and the lockfile that pair uses (here, root `yarn.lock`). That is often sufficient; do not broaden to other workspaces unless the ticket explicitly names them or the user asks.
+- **Nested monorepo packages** (`apps/<name>/package.json`, separate `yarn.lock`, etc.) are only in scope when the Jira issue names that path, a separate Snyk project points there, or the user confirms they want those included.
+- **If you are unsure** whether to fix only root vs nested manifests, **stop and ask one question** (see “Questions and recommendations”) instead of editing multiple `package.json` files by default.
+
+## Monorepos and nested manifests
+
+Treat nested manifests as **optional follow-ups**, not automatic scope. Same CVE may appear in Snyk scans for other folders; that does not mean every finding belongs in one Jira ticket’s PR unless the ticket or product owner says so.
+
+## Remediation logic
+
+1. Read the Jira ticket.
+2. Extract:
+   - vulnerable package
+   - introduced-through chain
+   - advisory link
+   - any stated fix version
+3. Open the advisory link.
+4. Identify the minimum safe version.
+5. Determine the smallest safe repo change:
+   - direct dependency: update `package.json`
+   - transitive dependency: prefer upgrading the nearest direct parent
+   - use `resolutions` or `overrides` only if already used in the repo or clearly necessary
+6. Ensure **C0** (Node) passes, then run:
+
+```bash
+yarn install
+```
+
+7. Verify `yarn.lock` changed when expected. **Yarn 1** may print `Resolution field "brace-expansion@…" is incompatible with requested version` for a global pin; if the lockfile still shows a **single** resolved `brace-expansion` version at the patched release (e.g. `5.0.5` for SNYK-JS-BRACEEXPANSION-15789759), treat **C9** as satisfied—do not assume the warning means the fix was skipped.
+8. Run the smallest relevant local validation.
+
+## GitHub and git guardrails
+
+Allowed:
+
+* checkout `main`
+* pull latest `main`
+* create one new branch for this task
+* commit only on that branch
+* push only to that branch
+* create one PR from that branch to `main`
+* read that PR and its CI/check results
+* push follow-up CI-fix commits only to that same branch
+
+Not allowed:
+
+* push to `main`
+* push to any existing branch
+* touch another developer’s branch
+* delete branches or tags
+* force push
+* rebase remote branches
+* reset remote history
+* merge or close PRs
+* modify unrelated PRs
+
+## Safe git flow
+
+**Use a second worktree** for Snyk remediation: the primary clone keeps its current branch and any local edits untouched. **Do not** use stash for this workflow.
+
+### Standard: worktree from `origin/main`
+
+From the **repository root** of the main clone (path must be **outside** the current worktree; a sibling directory is typical):
+
+```bash
+export SNYK_WT=../certifyos-worktree-<TICKET_KEY>
+git fetch origin main
+git worktree add -b chore/<TICKET_KEY>-snyk-<package> "$SNYK_WT" origin/main
+cd "$SNYK_WT"
+yarn install
+# apply dependency fix, commit, push only from this directory
+```
+
+Store:
+
+* `CREATED_BRANCH=chore/<TICKET_KEY>-snyk-<package>`
+
+When you no longer need the extra checkout (e.g. after merge), from any worktree of this repo:
+
+```bash
+git worktree remove "$SNYK_WT"
+```
+
+Notes:
+
+- **Disk / install:** the worktree needs its own `yarn install` and `node_modules`. Plan for extra space and time.
+- **Editor:** open the worktree folder as its own workspace when editing there.
+- **List / prune:** `git worktree list`; `git worktree prune` if a folder was removed manually.
+
+### Optional: same clone only when on `main` with a clean tree
+
+If you are on `main` with no uncommitted changes and prefer not to add a worktree:
+
+```bash
+git checkout main
+git pull origin main
+git checkout -b chore/<TICKET_KEY>-snyk-<package>
+```
+
+Before every commit, push, or PR action, verify:
+
+```bash
+git branch --show-current
+```
+
+If the current branch is not `CREATED_BRANCH`, stop and output the checkpoint summary table.
+
+## PR rules
+
+* base branch must be `main`
+* head branch must be `CREATED_BRANCH`
+* create only one PR for the task unless the user explicitly asks otherwise
+* **C11 is not satisfied by `git push` alone.** After the branch is on the remote, open the PR (GitHub UI, `gh pr create`, or API) and keep the PR URL for the final summary. Do not mark C11 PASS until the PR exists on GitHub.
+
+PR body should include:
+
+* summary
+* root cause
+* fix applied
+* validation performed
+* risk/rollback notes
+* advisory link
+* fixed version
+* whether the issue was direct or transitive
+
+## CI loop
+
+After the PR is created, record that moment as **T0** (PR opened on GitHub). **Do not poll every minute** or on a tight loop.
+
+### Reads (timing)
+
+1. **First read — ~5 minutes after T0:** fetch PR/check status once (e.g. `gh pr checks <PR#>`). If everything relevant is green and complete, you can finish.
+2. **Failure investigation — when anything fails:** as soon as a job fails (or after the first read shows failure), **pull logs immediately** (e.g. `gh run view <run-id> --log-failed`, or `gh api repos/.../actions/jobs/<job-id>/logs`). **Do not wait** until a ~30-minute “second read” to start debugging. The 30-minute window is for slow jobs, not for delaying triage.
+3. **Optional final read — ~30 minutes after T0:** one more check if long jobs (e.g. e2e) are still running or were slow to report.
+
+### PR comments and review feedback (~5 minutes after T0)
+
+After the PR exists, do **not** only watch CI: around **~5 minutes after T0** (or as soon as bots finish posting), **read PR feedback** and failing checks together.
+
+1. **Fetch:** issue comments, review summaries, and inline review threads (e.g. `gh pr view <n> --comments`, `gh api graphql` for `reviewThreads`, or GitHub UI). Automated comments (Codecov, OpenAPI, Snyk, `github-actions`) are informational unless they report a **blocking** failure.
+2. **Triage:** distinguish **valid** findings (incorrect lockfile, risky resolution, real test failure) from **false positives** (e.g. a bot misreading `package.json` structure). **Do not** “fix” valid `package.json` structure to satisfy a wrong comment.
+3. **Apply fixes when appropriate:** if a review or CI failure is **correct and in scope**, implement the **smallest** change on `CREATED_BRANCH` and push.
+4. **Separate commits:** use **one commit per logical change** (e.g. separate commits for: dependency/lockfile adjustment after review, empty CI retrigger, doc-only follow-up). **Do not** squash unrelated fixes into a single commit unless the user asks.
+
+### When CI fails — classify, then act
+
+1. **Understand the error:** registry/network flakes (e.g. `500 Internal Server Error` from `registry.yarnpkg.com` / npm tarball fetch), auth, timeouts, runner issues, or **real** code/test failures tied to the dependency change.
+2. **If the failure is clearly unrelated** (transient registry 5xx, network blip, cancelled job): **re-run CI** rather than changing code. If you cannot fix the root cause, **do not** spend time on a 25-minute wait before re-running.
+3. **If the failure is clearly caused by this PR** (lockfile, tests, build): apply the **smallest** fix on `CREATED_BRANCH` and push.
+
+### Re-running CI (prefer fast feedback)
+
+Use whichever is available in the environment:
+
+- **Re-run failed jobs only:** `gh run rerun <run-id> --failed` (after the run has finished; retries only failed jobs).
+- **Cancel a bad run, then start fresh:** `gh run cancel <run-id>` (stops an in-progress run), then push a new commit or use `gh workflow run` if your org allows it.
+- **Retrigger the PR pipeline:** `git commit --allow-empty -m "ci: retrigger workflows"` and `git push` on the **same branch** (always allowed; no code change). This starts a new workflow run for the PR.
+
+Do not merge or close PRs from this workflow unless the user explicitly asks.
+
+### After investigation
+
+* if CI passes, finish
+* if CI fails after a **re-run** and logs still show **no** concrete link to this change, document that (flake, environment) and stop after **2** CI-fix attempts (including re-runs)
+* if CI fails **only** fix failures clearly caused by this change
+* any CI follow-up commit must stay on `CREATED_BRANCH`
+* stop after **2** CI-fix attempts (including dependency/lockfile fixes; **re-runs** for transient errors do not count toward that limit as “code fixes”)
+
+Do not auto-fix code if:
+
+* the failure is unrelated
+* the failure already exists on base branch
+* the failure requires product judgment
+* the fix becomes broad or risky
+
+## Halt conditions
+
+Stop immediately and output the checkpoint summary table if any of these happen:
+
+* Node.js does not satisfy `engines.node` and cannot be switched (e.g. nvm unavailable or install still fails after aligning Node)
+* Jira MCP cannot read the ticket
+* advisory link cannot be found
+* advisory page cannot be opened
+* fix version cannot be determined
+* package/dependency path cannot be identified
+* GitHub contents or PR checks cannot be read
+* PR cannot be created from the created branch to `main`
+* current branch is not `CREATED_BRANCH`
+* a command would touch another branch
+* local validation fails in a way not clearly related to the change
+
+## Final response
+
+At completion or halt, provide:
+
+* ticket key
+* vulnerable package
+* fixed version chosen, if found
+* files changed, if any
+* PR link, if created
+* CI status, if available
+* checkpoint summary table
